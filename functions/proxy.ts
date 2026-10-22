@@ -1,6 +1,62 @@
-const DEFAULT_API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
-const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
+
+const DEFAULT_API_BASE_URL = "https://music.gdstudio.xyz/api.php";
+const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn\$/i;
 const SAFE_RESPONSE_HEADERS = ["content-type", "cache-control", "accept-ranges", "content-length", "content-range", "etag", "last-modified", "expires"];
+
+// --- ?? 新增：严格对齐 JavaScript 的 encodeURIComponent 规则 ---
+function jsEncodeURIComponent(str: string): string {
+  return encodeURIComponent(str)
+    .replace(/[( )]/g, (c) => c === '(' ? '%28' : '%29')
+    .replace(/\*/g, '%2A')
+    .replace(/'/g, '%27')
+    .replace(/!/g, '%21');
+}
+
+// --- ?? 新增：使用原生的 Web Crypto API 计算标准的 MD5 ---
+async function cryptoMd5(message: string): Promise<string> {
+  const msgUint8 = new TextEncoder().encode(message);
+  const hashBuffer = await crypto.subtle.digest('MD5', msgUint8);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// --- ?? 新增：从上游获取实时服务器时间，动态组装盐值并算出最终的签名 s ---
+async function getDynamicSign(keyword: string, apiBaseUrl: string): Promise<string> {
+  // 解析出基础域名，通常是 music.gdstudio.xyz 或 music-api.gdstudio.xyz
+  let host = "music.gdstudio.xyz";
+  try {
+    const parsedBase = new URL(apiBaseUrl);
+    host = parsedBase.hostname;
+  } catch {
+    // fallback
+  }
+
+  const VERSION = "2026.09.25"; 
+  const versionText = VERSION.split('.').map(p => p.padStart(2, '0')).join('');
+
+  try {
+    // 1. 同步请求上游服务器的时间接口
+    const timeResponse = await fetch(`https://${host}/time`);
+    const timeText = await timeResponse.text();
+    const serverTime = timeText.trim().substring(0, 9);
+
+    // 2. 拼接盐值
+    const encodedKeyword = jsEncodeURIComponent(keyword);
+    const saltString = `${serverTime}|${host}|${versionText}|${encodedKeyword}`;
+
+    // 3. 计算 MD5 截取大写后 8 位
+    const md5Hex = await cryptoMd5(saltString);
+    return md5Hex.substring(md5Hex.length - 8).toUpperCase();
+  } catch (e) {
+    console.warn(`[Sign Error] Failed to get server time, falling back to local time.`, e);
+    // 容灾：如果目标服务器 time 接口挂了，降级用当前边缘节点时间算
+    const localTime = Math.floor(Date.now() / 1000).toString().substring(0, 9);
+    const encodedKeyword = jsEncodeURIComponent(keyword);
+    const saltString = `${localTime}|${host}|${versionText}|${encodedKeyword}`;
+    const md5Hex = await cryptoMd5(saltString);
+    return md5Hex.substring(md5Hex.length - 8).toUpperCase();
+  }
+}
 
 function createCorsHeaders(init?: Headers): Headers {
   const headers = new Headers();
@@ -117,6 +173,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   const apiUrl = new URL(apiBaseUrl);
   url.searchParams.forEach((value, key) => {
+    // 这里拦截掉前端可能传来的过期或无用的 s 和其它特殊 key
     if (key === "target" || key === "callback" || key === "s" || key === "nocache") {
       return;
     }
@@ -127,10 +184,17 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     return new Response("Missing types", { status: 400 });
   }
 
+  // === ??? 核心改动：在向上游 fetch 之前，现场根据当前关键词动态算一个全新的 s ===
+  const keyword = url.searchParams.get('name') || '';
+  const dynamicS = await getDynamicSign(keyword, apiBaseUrl);
+  apiUrl.searchParams.set('s', dynamicS); // 强势注入最新合法 s 验证参数
+
   const upstream = await fetch(apiUrl.toString(), {
     headers: {
       "User-Agent": "Meting/1.5.0",
       "Accept": "application/json",
+      "Referer": `https://${apiUrl.hostname}/`,
+      "X-Requested-With": "XMLHttpRequest"
     },
   });
 
